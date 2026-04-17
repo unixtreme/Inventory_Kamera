@@ -104,6 +104,16 @@ namespace InventoryKamera
         {
 			var listManager = new DatabaseManager();
 
+			if (!listManager.HasRequiredLists())
+			{
+				Logger.Info("Lookup tables missing. Running initial game data update.");
+				var status = listManager.UpdateGameData(force: true);
+				if (status == UpdateStatus.Fail)
+				{
+					throw new InvalidOperationException("Lookup tables are missing and the initial game data update failed. Check the application log for details.");
+				}
+			}
+
 			Characters = listManager.LoadCharacters();
 			Artifacts = listManager.LoadArtifacts();
 			Weapons = listManager.LoadWeapons();

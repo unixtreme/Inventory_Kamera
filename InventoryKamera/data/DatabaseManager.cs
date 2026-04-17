@@ -40,6 +40,7 @@ namespace InventoryKamera
         private const string commitsAPIURL = "https://gitlab.com/api/v4/projects/53216109/repository/commits";
         private const string repoBaseURL = "https://gitlab.com/Dimbreath/AnimeGameData/-/raw/master/";
         private const string TextMapEnURL = repoBaseURL + "TextMap/TextMapEN.json";
+        private const string TextMapMediumEnURL = repoBaseURL + "TextMap/TextMap_MediumEN.json";
         private const string CharactersURL = repoBaseURL + "ExcelBinOutput/AvatarExcelConfigData.json";
         private const string ConstellationsURL = repoBaseURL + "ExcelBinOutput/FetterInfoExcelConfigData.json";
         private const string TalentsURL = repoBaseURL + "ExcelBinOutput/AvatarTalentExcelConfigData.json";
@@ -143,6 +144,20 @@ namespace InventoryKamera
         public Dictionary<string, string> LoadDevItems()
         {
             return GetList(ListType.CharacterDevelopmentItems).ToObject<Dictionary<string, string>>();
+        }
+
+        public bool HasRequiredLists()
+        {
+            return HasUsableList(WeaponsJson)
+                && HasUsableList(ArtifactsJson)
+                && HasUsableList(CharactersJson)
+                && HasUsableList(MaterialsJson);
+
+            bool HasUsableList(string file)
+            {
+                var path = ListsDir + file;
+                return File.Exists(path) && new FileInfo(path).Length > 2;
+            }
         }
 
         private JToken GetList(ListType list)
@@ -251,9 +266,18 @@ namespace InventoryKamera
             {
                 if (!Mappings.Any())
                 {
-                    Mappings = new ConcurrentDictionary<string, string>(JObject.Parse(LoadJsonFromURLAsync(TextMapEnURL))
-                        .ToObject<Dictionary<string, string>>()
-                        .Where(e => !string.IsNullOrWhiteSpace(e.Value)) // Remove any mapping with empty
+                    var mappings = JObject.Parse(LoadJsonFromURLAsync(TextMapEnURL))
+                        .ToObject<Dictionary<string, string>>();
+                    var mediumMappings = JObject.Parse(LoadJsonFromURLAsync(TextMapMediumEnURL))
+                        .ToObject<Dictionary<string, string>>();
+
+                    foreach (var entry in mediumMappings)
+                    {
+                        mappings[entry.Key] = entry.Value;
+                    }
+
+                    Mappings = new ConcurrentDictionary<string, string>(mappings
+                        .Where(e => !string.IsNullOrWhiteSpace(e.Value))
                         .ToDictionary(i => i.Key, i => i.Value));
                 }
             }
@@ -346,17 +370,47 @@ namespace InventoryKamera
                 Logger.Debug("Found {0} playable characters available", characters.Count);
                 characters.AsParallel().ForAll(character =>
                 {
-                    string name = Mappings[character["nameTextMapHash"].ToString()].ToString();
-
                     try
                     {
+                        int characterID = -1;
+                        if (character.TryGetValue("id", out var idToken))
+                        {
+                            if (!int.TryParse(idToken.ToString(), out characterID))
+                            {
+                                Logger.Warn("Skipping character. lookupType=characterIdParse, id={0}, nameTextMapHash={1}, iconName={2}, details={3}",
+                                    idToken?.ToString() ?? "missing",
+                                    character.TryGetValue("nameTextMapHash", out var fallbackNameHashToken) ? fallbackNameHashToken.ToString() : "",
+                                    character.TryGetValue("iconName", out var fallbackIconNameToken) ? fallbackIconNameToken.ToString() : "",
+                                    $"Unable to parse character id token: {idToken?.Type}");
+                                return;
+                            }
+                        }
+
+                        string nameTextMapHash = character.TryGetValue("nameTextMapHash", out var nameHashToken) ? nameHashToken.ToString() : "";
+                        string iconName = character.TryGetValue("iconName", out var iconNameToken) ? iconNameToken.ToString() : "";
+                        string name = "";
+
+                        void LogCharacterLookupFailure(string lookupType, string details = "")
+                        {
+                            Logger.Warn("Skipping character. lookupType={0}, id={1}, nameTextMapHash={2}, iconName={3}, details={4}",
+                                lookupType,
+                                characterID,
+                                nameTextMapHash,
+                                iconName,
+                                details);
+                        }
+
+                        if (string.IsNullOrWhiteSpace(nameTextMapHash) || !Mappings.TryGetValue(nameTextMapHash, out name))
+                        {
+                            LogCharacterLookupFailure("characterNameTextMapHash", "Name hash not found in TextMapEN.");
+                            return;
+                        }
 
                         if (name.ToLower() == "PlayerGirl".ToLower()) return; // Both travelers are listed but are essentially identical
 
                         string PascalCase = CultureInfo.GetCultureInfo("en").TextInfo.ToTitleCase(name);
                         string nameGOOD = Regex.Replace(PascalCase, @"[\W]", string.Empty);
                         string nameKey = nameGOOD.ToLower();
-                        int characterID = (int)character["id"];
 
                         string const3Description = "";
                         string skill = "";
@@ -369,7 +423,13 @@ namespace InventoryKamera
 
                             // Some characters have different internal names.
                             // Ex: Jean -> Qin, Yanfei -> Feiyan, etc.
-                            name = character["iconName"].ToString().Split('_').Last(); // UI_AvatarIcon_[Qin] -> Qin
+                            if (string.IsNullOrWhiteSpace(iconName))
+                            {
+                                LogCharacterLookupFailure("iconNameParse", "Character iconName is missing or empty.");
+                                return;
+                            }
+
+                            name = iconName.Split('_').Last(); // UI_AvatarIcon_[Qin] -> Qin
 
                             if (name.ToLower() == "PlayerBoy".ToLower()) // Handle traveler elements separately
                             {
@@ -395,10 +455,29 @@ namespace InventoryKamera
 
                                     if (elementSkill == null) continue;
 
-                                    skill = Mappings[elementSkill["nameTextMapHash"].ToString()].ToString();
+                                    string elementSkillHash = elementSkill.TryGetValue("nameTextMapHash", out var elementSkillHashToken) ? elementSkillHashToken.ToString() : "";
+                                    if (string.IsNullOrWhiteSpace(elementSkillHash) || !Mappings.TryGetValue(elementSkillHash, out skill))
+                                    {
+                                        LogCharacterLookupFailure("travelerSkillNameTextMapHash", $"Traveler element={element.Key}, skill hash missing from TextMapEN.");
+                                        continue;
+                                    }
 
-                                    const3Description = talents.Where(entry => entry["openConfig"].ToString().Contains($"Player_{element.Key}")).ElementAt(2)["descTextMapHash"].ToString();
-                                    const3Description = Mappings[const3Description].ToString();
+                                    var talentEntry = talents
+                                        .Where(entry => entry["openConfig"] != null && entry["openConfig"].ToString().Contains($"Player_{element.Key}"))
+                                        .Skip(2)
+                                        .FirstOrDefault();
+                                    if (talentEntry == null || !talentEntry.TryGetValue("descTextMapHash", out var travelerDescHashToken))
+                                    {
+                                        LogCharacterLookupFailure("travelerTalentDesc", $"Traveler element={element.Key}, missing third talent description.");
+                                        continue;
+                                    }
+
+                                    string travelerDescHash = travelerDescHashToken.ToString();
+                                    if (string.IsNullOrWhiteSpace(travelerDescHash) || !Mappings.TryGetValue(travelerDescHash, out const3Description))
+                                    {
+                                        LogCharacterLookupFailure("travelerTalentDescTextMapHash", $"Traveler element={element.Key}, desc hash missing from TextMapEN.");
+                                        continue;
+                                    }
 
                                     if (const3Description.Contains(skill))
                                     {
@@ -413,8 +492,19 @@ namespace InventoryKamera
                             }
                             else // Any other character that isn't traveler
                             {
-                                skill = skills.First(entry => entry["skillIcon"].ToString().Contains($"Skill_S_{name}"))["nameTextMapHash"].ToString();
-                                skill = Mappings[skill].ToString();
+                                var characterSkill = skills.FirstOrDefault(entry => entry["skillIcon"] != null && entry["skillIcon"].ToString().Contains($"Skill_S_{name}"));
+                                if (characterSkill == null || !characterSkill.TryGetValue("nameTextMapHash", out var skillHashToken))
+                                {
+                                    LogCharacterLookupFailure("characterSkillLookup", "Primary skill row/nameTextMapHash missing.");
+                                    return;
+                                }
+
+                                string skillHash = skillHashToken.ToString();
+                                if (string.IsNullOrWhiteSpace(skillHash) || !Mappings.TryGetValue(skillHash, out skill))
+                                {
+                                    LogCharacterLookupFailure("characterSkillNameTextMapHash", "Primary skill hash missing from TextMapEN.");
+                                    return;
+                                }
 
 
                                 value.Add("ConstellationName", new JArray
@@ -425,8 +515,22 @@ namespace InventoryKamera
                                 var constellationOrder = new JArray();
 
                                 // The skill/burst name is always mentioned in the constellation's description so we'll check for it
-                                const3Description = talents.Where(entry => entry["icon"].ToString().Contains(name)).ElementAt(2)["descTextMapHash"].ToString();
-                                const3Description = Mappings[const3Description].ToString();
+                                var thirdTalent = talents
+                                    .Where(entry => entry["icon"] != null && entry["icon"].ToString().Contains(name))
+                                    .Skip(2)
+                                    .FirstOrDefault();
+                                if (thirdTalent == null || !thirdTalent.TryGetValue("descTextMapHash", out var const3HashToken))
+                                {
+                                    LogCharacterLookupFailure("characterTalentDesc", "Missing third matching talent description.");
+                                    return;
+                                }
+
+                                string const3Hash = const3HashToken.ToString();
+                                if (string.IsNullOrWhiteSpace(const3Hash) || !Mappings.TryGetValue(const3Hash, out const3Description))
+                                {
+                                    LogCharacterLookupFailure("characterTalentDescTextMapHash", "Talent description hash missing from TextMapEN.");
+                                    return;
+                                }
 
                                 if (const3Description.Contains(skill))
                                 {
@@ -460,18 +564,33 @@ namespace InventoryKamera
                     }
                     catch (Exception ex)
                     {
-                        Logger.Warn("Problem when generating character information for {0}", name);
+                        Logger.Warn("Problem when generating character information. id={0}, nameTextMapHash={1}, iconName={2}",
+                            character.TryGetValue("id", out var idToken) ? idToken.ToString() : "missing",
+                            character.TryGetValue("nameTextMapHash", out var nameHashToken) ? nameHashToken.ToString() : "missing",
+                            character.TryGetValue("iconName", out var iconNameToken) ? iconNameToken.ToString() : "missing");
+                        Logger.Warn("Character payload: {0}", character.ToString(Formatting.None));
                         Logger.Warn(ex);
                     }
                 });
 
                 string GetConstellationNameFromId(int targetID)
                 {
-                    foreach (var constellation in from constellation in constellations
-                                                  where (((int)constellation["avatarId"]) == targetID)
-                                                  select constellation)
+                    foreach (var constellation in constellations.Where(c => c["avatarId"] != null && ((int)c["avatarId"]) == targetID))
                     {
-                        return Mappings[constellation["avatarConstellationBeforTextMapHash"].ToString()].ToString();
+                        if (!constellation.TryGetValue("avatarConstellationBeforTextMapHash", out var constellationHashToken))
+                        {
+                            Logger.Warn("Missing constellation hash field for character id={0}. lookupType=avatarConstellationBeforTextMapHash", targetID);
+                            return "";
+                        }
+
+                        string constellationHash = constellationHashToken.ToString();
+                        if (string.IsNullOrWhiteSpace(constellationHash) || !Mappings.TryGetValue(constellationHash, out var constellationName))
+                        {
+                            Logger.Warn("Missing constellation text mapping. lookupType=avatarConstellationBeforTextMapHash, id={0}, hash={1}", targetID, constellationHash);
+                            return "";
+                        }
+
+                        return constellationName;
                     }
 
                     return "";
@@ -479,11 +598,22 @@ namespace InventoryKamera
 
                 string GetElementFromID(int targetID)
                 {
-                    foreach (var element in from constellation in constellations
-                                            where (((int)constellation["avatarId"]) == targetID)
-                                            select constellation)
+                    foreach (var element in constellations.Where(c => c["avatarId"] != null && ((int)c["avatarId"]) == targetID))
                     {
-                        return Mappings[element["avatarVisionBeforTextMapHash"].ToString()].ToString().ToLower();
+                        if (!element.TryGetValue("avatarVisionBeforTextMapHash", out var visionHashToken))
+                        {
+                            Logger.Warn("Missing element hash field for character id={0}. lookupType=avatarVisionBeforTextMapHash", targetID);
+                            return "";
+                        }
+
+                        string visionHash = visionHashToken.ToString();
+                        if (string.IsNullOrWhiteSpace(visionHash) || !Mappings.TryGetValue(visionHash, out var elementName))
+                        {
+                            Logger.Warn("Missing element text mapping. lookupType=avatarVisionBeforTextMapHash, id={0}, hash={1}", targetID, visionHash);
+                            return "";
+                        }
+
+                        return elementName.ToLower();
                     }
                     return "";
                 }
